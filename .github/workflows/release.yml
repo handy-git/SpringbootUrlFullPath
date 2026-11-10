@@ -74,7 +74,14 @@ jobs:
 
       - name: Inspect plugin.xml
         run: |
-          unzip -p build/distributions/*.zip META-INF/plugin.xml > /tmp/plugin.xml
+          NAME="${GITHUB_REPOSITORY##*/}"
+          ZIP=$(ls build/distributions/*.zip | head -1)
+          # plugin.xml 位于插件 jar 内部，而非 zip 根目录
+          JAR=$(unzip -Z1 "$ZIP" | grep -E "^[^/]+/lib/${NAME}-[^/]+\.jar$" | head -1)
+          echo "产物：$ZIP"
+          echo "插件 jar：$JAR"
+          unzip -p "$ZIP" "$JAR" > /tmp/plugin.jar
+          unzip -p /tmp/plugin.jar META-INF/plugin.xml > /tmp/plugin.xml
           if grep -q 'until-build' /tmp/plugin.xml; then
             echo "::warning::plugin.xml 含 until-build，高于该上界的 IDE 无法安装"
           fi
