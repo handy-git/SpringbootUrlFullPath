@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    # 仅匹配形如 3.0.1 的版本 tag
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+  # 手动发布：选择要发布的分支
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '要发布的分支（例如 main、from_2026_2）'
+        required: true
+        default: main
+        type: string
+      notes:
+        description: 'Release 正文，留空则自动生成'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.branch || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build & Publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version and JDK
+        id: vars
+        run: |
+          TAG=$(sed -n 's/^version = "\(.*\)"$/\1/p' build.gradle.kts | head -1)
+          # 各分支 target 不同（main 为 17，from_2026_2 为 25），跟随 sourceCompatibility
+          JAVA_VERSION=$(sed -n 's/^ *sourceCompatibility = "\([0-9]*\)".*$/\1/p' build.gradle.kts | head -1)
+          JAVA_VERSION=${JAVA_VERSION:-21}
+
+          if [ -z "$TAG" ]; then
+            echo "::error::无法从 build.gradle.kts 解析 version"
+            exit 1
+          fi
+          # tag 触发时校验 tag 与版本号一致
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_name }}" != "$TAG" ]; then
+            echo "::error::tag(${{ github.ref_name }}) 与 build.gradle.kts 的 version($TAG) 不一致"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "java=$JAVA_VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本：$TAG，JDK：$JAVA_VERSION，提交：$GITHUB_SHA"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.vars.outputs.java }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build plugin
+        run: |
+          chmod +x gradlew
+          ./gradlew buildPlugin
+
+      - name: Inspect plugin.xml
+        run: |
+          unzip -p build/distributions/*.zip META-INF/plugin.xml > /tmp/plugin.xml
+          if grep -q 'until-build' /tmp/plugin.xml; then
+            echo "::warning::plugin.xml 含 until-build，高于该上界的 IDE 无法安装"
+          fi
+          grep -oE '(since|until)-build="[^"]*"' /tmp/plugin.xml || true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.vars.outputs.tag }}
+          NOTES_INPUT: ${{ inputs.notes }}
+        run: |
+          # 附注 tag 的说明优先作为正文
+          NOTES="$NOTES_INPUT"
+          if [ -z "$NOTES" ] && [ "$(git cat-file -t "$TAG" 2>/dev/null)" = "tag" ]; then
+            NOTES=$(git tag -l --format='%(contents)' "$TAG")
+          fi
+
+          # 手动发布时 tag 通常不存在，需要指定本次构建的提交
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            TARGET=()
+          else
+            TARGET=(--target "$GITHUB_SHA")
+          fi
+
+          if [ -n "$NOTES" ]; then
+            gh release create "$TAG" build/distributions/*.zip --title "$TAG" "${TARGET[@]}" --notes "$NOTES"
+          else
+            gh release create "$TAG" build/distributions/*.zip --title "$TAG" "${TARGET[@]}" --generate-notes
+          fi
